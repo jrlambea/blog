@@ -1,0 +1,236 @@
+
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+  <meta name="HandheldFriendly" content="True" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="robots" content="" />
+
+  <link href="https://fonts.googleapis.com/css?family=Source+Code+Pro|Source+Sans+Pro:300,400,400i,700" rel="stylesheet">
+
+    <link rel="stylesheet" type="text/css" href="https://jrlambea.me/theme/stylesheet/style.min.css">
+
+  <link rel="stylesheet" type="text/css" href="https://jrlambea.me/theme/pygments/emacs.min.css">
+  <link rel="stylesheet" type="text/css" href="https://jrlambea.me/theme/font-awesome/css/font-awesome.min.css">
+
+
+
+
+
+
+
+<meta name="author" content="J.R. Lambea" />
+<meta name="description" content="A raíz de un análisis de seguridad de una web, me encuentro con un portal en que permitía subir ficheros para el avatar en el que utilizaba la API de S3 para realizar las subidas y descargas a un Bucket S3, el problema es que ese acceso era público y además, con directory listing, por lo que permite a cualquiera saber que hay ahí dentro y descargar una copia de esos ficheros." />
+<meta name="keywords" content="AWS, Powershell, Pentesting">
+
+<meta property="og:site_name" content="J.R. Blog"/>
+<meta property="og:title" content="Index y data dump en S3 Buckets abiertos"/>
+<meta property="og:description" content="A raíz de un análisis de seguridad de una web, me encuentro con un portal en que permitía subir ficheros para el avatar en el que utilizaba la API de S3 para realizar las subidas y descargas a un Bucket S3, el problema es que ese acceso era público y además, con directory listing, por lo que permite a cualquiera saber que hay ahí dentro y descargar una copia de esos ficheros."/>
+<meta property="og:locale" content="en_US"/>
+<meta property="og:url" content="https://jrlambea.me/index-y-data-dump-en-s3-bucket-publicos.html"/>
+<meta property="og:type" content="article"/>
+<meta property="article:published_time" content="2020-07-07 14:05:00+02:00"/>
+<meta property="article:modified_time" content=""/>
+<meta property="article:author" content="https://jrlambea.me/author/jr-lambea.html">
+<meta property="article:section" content="AWS"/>
+<meta property="article:tag" content="AWS"/>
+<meta property="article:tag" content="Powershell"/>
+<meta property="article:tag" content="Pentesting"/>
+<meta property="og:image" content="">
+
+  <title>J.R. Blog &ndash; Index y data dump en S3 Buckets abiertos</title>
+
+</head>
+<body>
+  <aside>
+    <div>
+      <a href="https://jrlambea.me">
+        <img src="https://jrlambea.me/theme/img/profile.png" alt="" title="">
+      </a>
+      <h1><a href="https://jrlambea.me"></a></h1>
+
+<p>SysAdmin | Security Operations | Cloud Infrastructure</p>
+
+      <ul class="social">
+        <li><a class="sc-github" href="https://github.com/jrlambea" target="_blank"><i class="fa fa-github"></i></a></li>
+        <li><a class="sc-linkedin" href="https://www.linkedin.com/in/jrlambea/" target="_blank"><i class="fa fa-linkedin"></i></a></li>
+      </ul>
+    </div>
+
+
+  </aside>
+  <main>
+
+
+<article class="single">
+  <header>
+      
+    <h1 id="index-y-data-dump-en-s3-bucket-publicos">Index y data dump en S3 Buckets abiertos</h1>
+    <p>
+          Posted on Tue 07 July 2020 in <a href="https://jrlambea.me/category/aws.html">AWS</a>
+
+
+    </p>
+  </header>
+
+
+  <div>
+    <!-- Modified: 2020-07-07 15:38 -->
+
+<p>En este caso presento un script de Powershell que permite recorrer un Bucket de S3 en el cual los permisos deben ser abiertos completamente (al menos de lectura) y público.</p>
+<p>La API web de S3 es muy sencilla de utilizar, gracias a que permite peticiones GET, es posible realizar estas peticiones desde la misma barra de direcciones del navegador.</p>
+<p>En el <a href="https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListObjects.html">enlace</a> se puede ver qué parámetros acepta esta API via URL:</p>
+<ul>
+<li><code>delimiter</code></li>
+<li><code>encoding-type</code></li>
+<li><code>marker</code></li>
+<li><code>max-keys</code></li>
+<li><code>prefix</code></li>
+</ul>
+<p>Si se realiza una petición a la API, esta retornará un objeto en XML con la siguiente estructura, y en rojo marco las opciones que son interesantes por lo que se explicará a continuación:</p>
+<p><center>
+<img alt="Estructura XML" src="img/xmlparser.jpg">
+</center></p>
+<p>Por diseño, la API sólo retornará cómo máximo los 1000 primeros objetos que encuentre, esto quiere decir que si hubieran más se deberá cambiar la consulta para que aparezcan los restantes, pero de haber más de 1000 nunca se podrá obtener la lista de todos los objetos de una sola consulta.</p>
+<p><code>max-keys</code> puede llevar a engaño por que sirve para restringir aún más ese número de elementos a retornar, <strong>en ningún caso serviría para ampliar ese número de elementos a más de 1000</strong>.</p>
+<p>Pero tenemos dos atributos, <code>IsTruncated</code> que nos indica si el resultado se ha tenido que truncar debido al gran número de elementos, y <code>marker</code>, con el que podemos indicar a partir de qué elemento o clave queremos que nos muestre resultados, gracias a esto podemos saber si hay <em>más páginas</em> de resultados, y en qué punto nos quedamos para seguir paginando.</p>
+<p>El siguiente script Powershell permitiría indexar todos los elementos de dentro de un Bucket S3, y permitiría también descargarlos y tener una réplica de todo un bucket en local.</p>
+<div class="highlight"><pre><span></span><code><span class="p">[</span><span class="k">CmdletBinding</span><span class="p">()]</span>
+<span class="k">param</span> <span class="p">(</span>
+    <span class="c"># S3 Bucket to target</span>
+    <span class="p">[</span><span class="k">Parameter</span><span class="p">()]</span>
+    <span class="no">[String]</span>
+    <span class="nv">$Bucket</span><span class="p">,</span>
+
+    <span class="c"># AWS Region of the bucket</span>
+    <span class="p">[</span><span class="k">Parameter</span><span class="p">()]</span>
+    <span class="no">[String]</span>
+    <span class="nv">$Region</span><span class="p">,</span>
+
+    <span class="c"># Object name prefix filter</span>
+    <span class="p">[</span><span class="k">Parameter</span><span class="p">()]</span>
+    <span class="no">[String]</span>
+    <span class="nv">$Prefix</span> <span class="p">=</span> <span class="no">[String]</span><span class="p">::</span><span class="n">Empty</span><span class="p">,</span>
+
+    <span class="c"># Object name prefix filter</span>
+    <span class="p">[</span><span class="k">Parameter</span><span class="p">()]</span>
+    <span class="no">[Switch]</span>
+    <span class="nv">$Download</span> <span class="p">=</span> <span class="nv">$False</span>
+<span class="p">)</span>
+
+<span class="nv">$bucketUrl</span><span class="p">=</span><span class="s2">&quot;https://s3.${Region}.amazonaws.com/${Bucket}/&quot;</span>
+<span class="nv">$bucketUrlWithPrefix</span><span class="p">=</span><span class="s2">&quot;${bucketUrl}?prefix=${prefix}&quot;</span>
+
+<span class="no">[xml]</span><span class="nv">$data</span> <span class="p">=</span> <span class="nb">Invoke-WebRequest</span> <span class="nv">$bucketUrlWithPrefix</span>
+
+<span class="nb">Write-Verbose</span> <span class="s2">&quot;Find the first </span><span class="p">$((</span><span class="nv">$data</span><span class="p">.</span><span class="n">ListBucketResult</span><span class="p">.</span><span class="n">Contents</span><span class="p">.</span><span class="n">Key</span><span class="p">).</span><span class="n">Count</span><span class="p">)</span><span class="s2"> objects.&quot;</span>
+
+<span class="nv">$Objects</span> <span class="p">=</span> <span class="p">@()</span>
+<span class="nv">$Objects</span> <span class="p">+=</span> <span class="nv">$data</span><span class="p">.</span><span class="n">ListBucketResult</span><span class="p">.</span><span class="n">Contents</span>
+
+<span class="nv">$i</span><span class="p">=</span><span class="n">1</span>
+
+<span class="k">While</span> <span class="p">(</span><span class="nv">$data</span><span class="p">.</span><span class="n">ListBucketResult</span><span class="p">.</span><span class="n">IsTruncated</span> <span class="o">-eq</span> <span class="s2">&quot;true&quot;</span><span class="p">)</span> <span class="p">{</span>
+    <span class="nb">Write-Verbose</span> <span class="s2">&quot;Crawling page: $i&quot;</span>
+
+    <span class="nv">$lastItem</span> <span class="p">=</span> <span class="nv">$Objects</span><span class="p">[-</span><span class="n">1</span><span class="p">].</span><span class="n">Key</span>
+    <span class="no">[xml]</span><span class="nv">$data</span> <span class="p">=</span> <span class="nb">Invoke-WebRequest</span> <span class="n">-Uri</span> <span class="s2">&quot;${bucketUrlWithPrefix}&amp;marker=${lastItem}&quot;</span>
+    <span class="nv">$Objects</span> <span class="p">+=</span> <span class="nv">$data</span><span class="p">.</span><span class="n">ListBucketResult</span><span class="p">.</span><span class="n">Contents</span>
+
+    <span class="nb">Write-Verbose</span> <span class="s2">&quot;Total Objects: </span><span class="p">$(</span><span class="nv">$Objects</span><span class="p">.</span><span class="n">Count</span><span class="p">)</span><span class="s2">&quot;</span>
+
+    <span class="nv">$i</span><span class="p">++</span>
+<span class="p">}</span>
+
+<span class="k">If</span> <span class="p">(</span><span class="nv">$Download</span><span class="p">)</span> <span class="p">{</span>
+
+    <span class="nb">Write-Verbose</span> <span class="s2">&quot;Creating folder ${Bucket}&quot;</span>
+
+    <span class="nb">New-Item</span> <span class="n">-Type</span> <span class="n">Container</span> <span class="s2">&quot;${Bucket}&quot;</span>
+
+    <span class="k">ForEach</span> <span class="p">(</span><span class="nv">$Object</span> <span class="k">in</span> <span class="nv">$Objects</span><span class="p">)</span> <span class="p">{</span>
+        <span class="nv">$objectKey</span> <span class="p">=</span> <span class="nv">$Object</span><span class="p">.</span><span class="n">Key</span><span class="p">.</span><span class="n">Trim</span><span class="p">(</span><span class="s2">&quot;\&quot;</span><span class="p">)</span>
+        <span class="nv">$objectPath</span> <span class="p">=</span> <span class="nb">Split-Path</span> <span class="nv">$objectKey</span>
+
+        <span class="k">If</span> <span class="p">(!(</span><span class="nb">Test-Path</span> <span class="nv">$objectPath</span><span class="p">))</span> <span class="p">{</span>
+            <span class="nb">New-Item</span> <span class="n">-Type</span> <span class="n">Container</span> <span class="s2">&quot;${Bucket}/${objectPath}&quot;</span>
+        <span class="p">}</span>
+
+        <span class="nb">Invoke-WebRequest</span> <span class="n">-Uri</span> <span class="s2">&quot;${bucketUrl}${objectKey}&quot;</span> <span class="n">-OutFile</span> <span class="s2">&quot;${Bucket}/${objectKey}&quot;</span>
+    <span class="p">}</span>
+<span class="p">}</span>
+
+<span class="nv">$Objects</span>
+</code></pre></div>
+  </div>
+  <div class="tag-cloud">
+    <p>
+      <a href="https://jrlambea.me/tag/aws.html">AWS</a>
+      <a href="https://jrlambea.me/tag/powershell.html">Powershell</a>
+      <a href="https://jrlambea.me/tag/pentesting.html">Pentesting</a>
+    </p>
+  </div>
+
+
+
+
+
+<!-- Disqus -->
+<div id="disqus_thread"></div>
+<script type="text/javascript">
+    var disqus_shortname = 'blog-ecg5wppj8o';
+    (function() {
+        var dsq = document.createElement('script'); dsq.type = 'text/javascript'; dsq.async = true;
+        dsq.src = '//' + disqus_shortname + '.disqus.com/embed.js';
+        (document.getElementsByTagName('head')[0] || document.getElementsByTagName('body')[0]).appendChild(dsq);
+    })();
+</script>
+<noscript>
+        Please enable JavaScript to view comments.
+
+</noscript>
+<!-- End Disqus -->
+</article>
+
+    <footer>
+<p>&copy; J. R. Lambea 2020</p>
+<p>    Powered by <a href="http://getpelican.com" target="_blank">Pelican</a> - <a href="https://github.com/alexandrevicenzi/flex" target="_blank">Flex</a> theme by <a href="http://alexandrevicenzi.com" target="_blank">Alexandre Vicenzi</a>
+</p>    </footer>
+  </main>
+
+
+
+
+<script type="application/ld+json">
+{
+  "@context" : "http://schema.org",
+  "@type" : "Blog",
+  "name": " J.R. Blog ",
+  "url" : "https://jrlambea.me",
+  "image": "",
+  "description": ""
+}
+</script>
+
+<a href="https://github.com/jrlambea/blog/" class="github-corner" aria-label="View source on Github">
+    <svg width="80"
+         height="80"
+         viewBox="0 0 250 250"
+         style="fill:#151513; color:#fff; position: absolute; top: 0; border: 0; right: 0;"
+         aria-hidden="true">
+        <path d="M0,0 L115,115 L130,115 L142,142 L250,250 L250,0 Z"></path>
+        <path d="M128.3,109.0 C113.8,99.7 119.0,89.6 119.0,89.6 C122.0,82.7 120.5,78.6 120.5,78.6 C119.2,72.0 123.4,76.3 123.4,76.3 C127.3,80.9 125.5,87.3 125.5,87.3 C122.9,97.6 130.6,101.9 134.4,103.2"
+              fill="currentColor"
+              style="transform-origin: 130px 106px;"
+              class="octo-arm">
+        </path>
+        <path d="M115.0,115.0 C114.9,115.1 118.7,116.5 119.8,115.4 L133.7,101.6 C136.9,99.2 139.9,98.4 142.2,98.6 C133.8,88.0 127.5,74.4 143.8,58.0 C148.5,53.4 154.0,51.2 159.7,51.0 C160.3,49.4 163.2,43.6 171.4,40.1 C171.4,40.1 176.1,42.5 178.8,56.2 C183.1,58.6 187.2,61.8 190.9,65.4 C194.5,69.0 197.7,73.2 200.1,77.6 C213.8,80.2 216.3,84.9 216.3,84.9 C212.7,93.1 206.9,96.0 205.4,96.6 C205.1,102.4 203.0,107.8 198.3,112.5 C181.9,128.9 168.3,122.5 157.7,114.1 C157.9,116.9 156.7,120.9 152.7,124.9 L141.0,136.5 C139.8,137.7 141.6,141.9 141.8,141.8 Z"
+              fill="currentColor"
+              class="octo-body">
+        </path>
+    </svg>
+</a>
+<style>.github-corner:hover .octo-arm{animation:octocat-wave 560ms ease-in-out}@keyframes octocat-wave{0%,100%{transform:rotate(0)}20%,60%{transform:rotate(-25deg)}40%,80%{transform:rotate(10deg)}}@media (max-width:500px){.github-corner:hover .octo-arm{animation:none}.github-corner .octo-arm{animation:octocat-wave 560ms ease-in-out}}</style></body>
+</html>
