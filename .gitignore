@@ -1,4 +1,5 @@
 **.vscode/
 **__pycache__/
 upload.cmd
-**themes/
+**pelican-themes/
+**output/
